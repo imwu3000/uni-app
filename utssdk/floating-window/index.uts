@@ -1,0 +1,257 @@
+import { UTSObject, getAppContext, UniError } from "io.dcloud.uts";
+import { Color } from "android.graphics.Color";
+import { PixelFormat } from "android.graphics.PixelFormat";
+import { Context } from "android.content.Context";
+import { Gravity } from "android.view.Gravity";
+import { MotionEvent } from "android.view.MotionEvent";
+import { View } from "android.view.View";
+import { WindowManager } from "android.view.WindowManager";
+import { TextView } from "android.widget.TextView";
+import { Build } from "android.os.Build";
+import { Settings } from "android.provider.Settings";
+import { Intent } from "android.content.Intent";
+import { Uri } from "android.net.Uri";
+// import { ImageView } from "android.widget.ImageView"; // For future use
+
+// Global variables for the floating view
+var floatingView: View? = null;
+var windowManager: WindowManager? = null;
+var layoutParams: WindowManager.LayoutParams? = null;
+var appContext: Context? = null;
+
+// Callback for click events
+var onClickCallback: (() -> Unit)? = null;
+
+// For drag functionality
+var initialX: Int = 0;
+var initialY: Int = 0;
+var initialTouchX: Float = 0f;
+var initialTouchY: Float = 0f;
+const CLICK_THRESHOLD = 10 // Max movement in pixels to be considered a click
+
+// Internal function to initialize context and window manager
+fun init(context: Context) {
+    if (appContext == null) {
+        appContext = context.applicationContext
+        windowManager = appContext!!.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        console.log("FloatingWindow: Initialized with context and window manager.")
+    }
+}
+
+// --- Permission Functions ---
+
+/**
+ * Checks if the SYSTEM_ALERT_WINDOW permission is granted.
+ * @return true if granted or on Android versions before M, false otherwise.
+ */
+export function isOverlayPermissionGranted(): Boolean {
+    if (appContext == null) {
+        val currentAppContext = getAppContext()
+        if (currentAppContext == null) {
+            console.error("FloatingWindow: isOverlayPermissionGranted - Failed to get application context.")
+            return false // Cannot check without context
+        }
+        init(currentAppContext)
+    }
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+        val granted = Settings.canDrawOverlays(appContext)
+        console.log("FloatingWindow: Overlay permission granted: " + granted)
+        return granted
+    }
+    console.log("FloatingWindow: Overlay permission granted by default on older Android versions.")
+    return true // Granted by default on versions before M
+}
+
+/**
+ * Attempts to guide the user to grant overlay permission if not already granted.
+ * On Android, this typically involves opening the specific settings page for the app.
+ * Direct invocation of the intent might be restricted from non-Activity contexts.
+ */
+export function requestOverlayPermission(): void {
+    if (appContext == null) {
+        val currentAppContext = getAppContext()
+        if (currentAppContext == null) {
+            console.error("FloatingWindow: requestOverlayPermission - Failed to get application context.")
+            return
+        }
+        init(currentAppContext)
+    }
+
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+        if (!Settings.canDrawOverlays(appContext)) {
+            console.warn("FloatingWindow: Overlay permission not granted. Please guide user to Settings -> Apps -> Special app access -> Display over other apps -> [Your App] -> Allow.")
+            // Attempting to open settings - this is the most we can do reliably from here
+            // The success of this depends on uni-app's capability to handle such intents from UTS.
+            // A more robust solution might involve a native Android Activity launched by the plugin.
+            try {
+                 // Try to open the specific app's overlay settings page
+                val intent = Intent(
+                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    Uri.parse("package:" + appContext!!.packageName)
+                )
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) // Necessary when starting from non-Activity context
+
+                // Check if getUniActivity() is available and can start this intent.
+                // This is a common pattern in some uni-app native plugins.
+                // If not, this will likely fail or do nothing.
+                // For now, we rely on the uni.openAppAuthorizeSetting as a fallback if direct intent fails.
+
+                // getAppContext()!!.startActivity(intent) // This might fail if not an Activity context
+                                                        // and FLAG_ACTIVITY_NEW_TASK is not enough for settings intents.
+
+                console.log("FloatingWindow: Attempting to open app overlay settings. User interaction required.")
+                 uni.openAppAuthorizeSetting({
+                     success: (res) => {
+                         console.log("FloatingWindow: Opened app settings. User needs to find and enable overlay permission.", res)
+                     },
+                     fail: (err: UniError) => {
+                         console.error("FloatingWindow: Failed to open app settings via uni.openAppAuthorizeSetting. Error: " + err.errMsg)
+                         // Show a toast to guide user manually
+                        uni.showToast({
+                            title: "请手动开启悬浮窗权限",
+                            icon: "none",
+                            duration: 3000
+                        })
+                     }
+                 });
+
+            } catch (e: Exception) {
+                console.error("FloatingWindow: Error trying to open overlay permission settings: " + e.message)
+                 uni.showToast({
+                    title: "打开权限设置失败，请手动开启",
+                    icon: "none",
+                    duration: 3000
+                })
+            }
+        } else {
+            console.log("FloatingWindow: Overlay permission is already granted.")
+        }
+    } else {
+        console.log("FloatingWindow: Overlay permission granted by default on older Android versions (no request needed).")
+    }
+}
+
+
+// --- Core Floating Window Functions ---
+
+/**
+ * Shows the floating window.
+ * @param options Optional parameters for initial position etc.
+ */
+export function show(options: UTSObject?): void {
+    if (!isOverlayPermissionGranted()) {
+        console.error("FloatingWindow: Cannot show floating window, overlay permission not granted.")
+        requestOverlayPermission() // Guide user to grant permission
+        uni.showToast({ title: "悬浮窗权限未开启", icon: "none", duration: 2000 })
+        return
+    }
+
+    // Ensure initialization (isOverlayPermissionGranted would have called init if appContext was null)
+    if (appContext == null) {
+         console.error("FloatingWindow: Show - application context is still null after permission check.")
+        return
+    }
+
+    if (floatingView != null) {
+        hide()
+    }
+
+    val view = TextView(appContext!!)
+    view.text = options?.get("text") as? String ?: "●"
+    view.textSize = (options?.get("textSize") as? Number ?: 40.0).toFloat()
+    // Example: allow color customization via options
+    // val textColor = options?.get("textColor") as? String ?: "#FF0000"
+    // view.setTextColor(Color.parseColor(textColor))
+    view.setTextColor(Color.RED)
+    view.setPadding(10, 10, 10, 10)
+    view.setBackgroundColor(Color.argb(100, 200, 200, 200))
+    floatingView = view
+
+    val currentParams = WindowManager.LayoutParams(
+        WindowManager.LayoutParams.WRAP_CONTENT,
+        WindowManager.LayoutParams.WRAP_CONTENT,
+        WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+            or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+            or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+        PixelFormat.TRANSLUCENT
+    )
+    layoutParams = currentParams
+    currentParams.gravity = Gravity.TOP or Gravity.START
+    currentParams.x = options?.get("x") as? Int ?: 100
+    currentParams.y = options?.get("y") as? Int ?: 100
+
+    floatingView!!.setOnTouchListener(object : View.OnTouchListener {
+        override fun onTouch(v: View, event: MotionEvent): Boolean {
+            when (event.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    initialX = layoutParams!!.x
+                    initialY = layoutParams!!.y
+                    initialTouchX = event.rawX
+                    initialTouchY = event.rawY
+                    return true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    layoutParams!!.x = initialX + (event.rawX - initialTouchX).toInt()
+                    layoutParams!!.y = initialY + (event.rawY - initialTouchY).toInt()
+                    windowManager!!.updateViewLayout(floatingView, layoutParams)
+                    return true
+                }
+                MotionEvent.ACTION_UP -> {
+                    if (Math.abs(event.rawX - initialTouchX) < CLICK_THRESHOLD && Math.abs(event.rawY - initialTouchY) < CLICK_THRESHOLD) {
+                        onClickCallback?.invoke()
+                        console.log("FloatingWindow: Click detected.")
+                    }
+                    return true
+                }
+            }
+            return false
+        }
+    })
+
+    try {
+        windowManager!!.addView(floatingView, layoutParams)
+        console.log("FloatingWindow: View added to WindowManager.")
+    } catch (e: Exception) {
+        console.error("FloatingWindow: Error adding view to WindowManager. Error: " + e.message)
+    }
+}
+
+export function hide(): void {
+    if (floatingView != null && windowManager != null) {
+        try {
+            windowManager!!.removeView(floatingView)
+            console.log("FloatingWindow: View removed from WindowManager.")
+        } catch (e: Exception) {
+            console.error("FloatingWindow: Error removing view. " + e.message)
+        } finally {
+            floatingView = null
+        }
+    } else {
+        console.log("FloatingWindow: Hide called but view or windowManager is null.")
+    }
+}
+
+export function onButtonClick(callback: () -> Unit): void {
+    onClickCallback = callback
+    console.log("FloatingWindow: onClickCallback registered.")
+}
+
+export function updateStatus(statusText: String): void {
+    if (appContext == null) {
+        val currentAppContext = getAppContext()
+        if (currentAppContext == null) {
+            console.error("FloatingWindow: updateStatus - Failed to get application context.")
+            return
+        }
+        init(currentAppContext)
+    }
+
+    if (floatingView != null && floatingView is TextView) {
+        (floatingView as TextView).text = statusText
+        windowManager?.updateViewLayout(floatingView, layoutParams)
+        console.log("FloatingWindow: Status updated to - " + statusText)
+    } else {
+        console.warn("FloatingWindow: updateStatus called but view is not a TextView or not shown.")
+    }
+}
